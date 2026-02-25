@@ -1,0 +1,338 @@
+import { Contract } from 'trac-peer'
+
+class JobBoardContract extends Contract {
+  /**
+   * IntercomJobBoard — P2P Job Board Contract
+   *
+   * Forked from Trac-Systems/intercom reference implementation.
+   * Unique feature: on-chain skill tag index for filtering jobs by required skills.
+   *
+   * State keys:
+   *   jobs/count                     → total jobs posted
+   *   jobs/<id>                      → full job object (includes skills array)
+   *   jobs/by/<address>/<id>         → index: jobs by poster
+   *   skills/<tag>/count             → how many jobs require this skill
+   *   skills/<tag>/<job_id>          → index: job IDs under a skill tag
+   *   apps/count                     → total applications
+   *   apps/<id>                      → application object
+   *   apps/by/<address>/<id>         → index: applications by applicant
+   *   currentTime                    → injected by timer feature
+   *   chat_last                      → last chat message
+   */
+  constructor(protocol, options = {}) {
+    super(protocol, options);
+
+    // --- post a job with required skill tags ---
+    this.addSchema('postJob', {
+      value: {
+        $$strict: true,
+        $$type: 'object',
+        op:          { type: 'string', min: 1, max: 32 },
+        title:       { type: 'string', min: 2, max: 120 },
+        description: { type: 'string', min: 5, max: 1000 },
+        contact:     { type: 'string', min: 2, max: 200 },
+        category:    { type: 'string', min: 2, max: 40 },
+        budget:      { type: 'string', min: 0, max: 80, optional: true },
+        // comma-separated skill tags e.g. "javascript,nodejs,p2p"
+        skills:      { type: 'string', min: 1, max: 300 },
+      }
+    });
+
+    // --- apply to a job ---
+    this.addSchema('applyJob', {
+      value: {
+        $$strict: true,
+        $$type: 'object',
+        op:      { type: 'string', min: 1, max: 32 },
+        job_id:  { type: 'number', min: 0 },
+        skills:  { type: 'string', min: 2, max: 500 },
+        contact: { type: 'string', min: 2, max: 200 },
+      }
+    });
+
+    // --- close a job (poster only) ---
+    this.addSchema('closeJob', {
+      value: {
+        $$strict: true,
+        $$type: 'object',
+        op:     { type: 'string', min: 1, max: 32 },
+        job_id: { type: 'number', min: 0 },
+      }
+    });
+
+    // --- filter jobs by skill tag ---
+    this.addSchema('filterBySkill', {
+      value: {
+        $$strict: true,
+        $$type: 'object',
+        op:    { type: 'string', min: 1, max: 32 },
+        skill: { type: 'string', min: 1, max: 60 },
+      }
+    });
+
+    // --- read helpers ---
+    this.addFunction('readStats');
+    this.addFunction('readChatLast');
+    this.addFunction('readTimer');
+
+    this.addSchema('readJob', {
+      value: {
+        $$strict: true,
+        $$type: 'object',
+        op:     { type: 'string', min: 1, max: 32 },
+        job_id: { type: 'number', min: 0 },
+      }
+    });
+
+    this.addSchema('readJobApps', {
+      value: {
+        $$strict: true,
+        $$type: 'object',
+        op:     { type: 'string', min: 1, max: 32 },
+        job_id: { type: 'number', min: 0 },
+      }
+    });
+
+    this.addSchema('readSkillJobs', {
+      value: {
+        $$strict: true,
+        $$type: 'object',
+        op:    { type: 'string', min: 1, max: 32 },
+        skill: { type: 'string', min: 1, max: 60 },
+      }
+    });
+
+    // --- timer feature ---
+    const _this = this;
+    this.addSchema('feature_entry', {
+      key:   { type: 'string', min: 1, max: 256 },
+      value: { type: 'any' }
+    });
+
+    this.addFeature('timer_feature', async function () {
+      if (false === _this.check.validateSchema('feature_entry', _this.op)) return;
+      if (_this.op.key === 'currentTime') {
+        await _this.put(_this.op.key, _this.op.value);
+      }
+    });
+
+    // --- message handler ---
+    this.messageHandler(async function () {
+      if (_this.op?.type === 'msg' && typeof _this.op.msg === 'string') {
+        const currentTime = await _this.get('currentTime');
+        await _this.put('chat_last', {
+          msg:     _this.op.msg,
+          address: _this.op.address ?? null,
+          at:      currentTime ?? null
+        });
+      }
+    });
+  }
+
+  // ─── helpers ────────────────────────────────────────────────────────────────
+
+  /**
+   * Parse comma-separated skills into a clean lowercase array.
+   * "JavaScript, Node.js, P2P" → ["javascript", "nodejs", "p2p"]
+   * Max 10 tags per job, 40 chars each.
+   */
+  _parseSkills(raw) {
+    if (!raw || typeof raw !== 'string') return [];
+    return raw
+      .split(',')
+      .map((s) => s.trim().toLowerCase().replace(/[^a-z0-9+#.-]/g, ''))
+      .filter((s) => s.length > 0 && s.length <= 40)
+      .slice(0, 10);
+  }
+
+  // ─── contract functions ──────────────────────────────────────────────────────
+
+  /**
+   * Post a new job listing and index it under each skill tag.
+   * Every skill tag becomes a queryable key on-chain.
+   */
+  async postJob() {
+    const title       = this.value.title;
+    const description = this.value.description;
+    const contact     = this.value.contact;
+    const category    = this.value.category;
+    const budget      = this.value.budget ?? '';
+    const skillTags   = this._parseSkills(this.value.skills);
+
+    if (skillTags.length === 0) return new Error('At least one valid skill tag is required.');
+
+    const countRaw    = await this.get('jobs/count');
+    const count       = countRaw !== null ? Number(countRaw) : 0;
+    const id          = count;
+    const currentTime = await this.get('currentTime');
+
+    const job = {
+      id,
+      title,
+      description,
+      contact,
+      category,
+      budget,
+      skills:   skillTags,
+      poster:   this.address,
+      postedAt: currentTime ?? null,
+      open:     true,
+    };
+
+    // store the job itself
+    await this.put(`jobs/${id}`, job);
+    await this.put(`jobs/by/${this.address}/${id}`, id);
+    await this.put('jobs/count', count + 1);
+
+    // index each skill tag → job id (the unique feature)
+    for (const tag of skillTags) {
+      const tagCountRaw = await this.get(`skills/${tag}/count`);
+      const tagCount    = tagCountRaw !== null ? Number(tagCountRaw) : 0;
+      await this.put(`skills/${tag}/${id}`, id);
+      await this.put(`skills/${tag}/count`, tagCount + 1);
+    }
+
+    console.log(`[JobBoard] Job #${id} posted: "${title}" | skills: ${skillTags.join(', ')} | by ${this.address}`);
+  }
+
+  /**
+   * Apply to an existing job.
+   */
+  async applyJob() {
+    const jobId   = this.value.job_id;
+    const skills  = this.value.skills;
+    const contact = this.value.contact;
+
+    const job = await this.get(`jobs/${jobId}`);
+    if (job === null)       return new Error('Job not found.');
+    if (job.open === false) return new Error('Job is closed.');
+
+    const countRaw    = await this.get('apps/count');
+    const count       = countRaw !== null ? Number(countRaw) : 0;
+    const id          = count;
+    const currentTime = await this.get('currentTime');
+
+    const application = {
+      id,
+      job_id:    jobId,
+      skills,
+      contact,
+      applicant: this.address,
+      appliedAt: currentTime ?? null,
+    };
+
+    await this.put(`apps/${id}`, application);
+    await this.put(`apps/by/${this.address}/${id}`, id);
+    await this.put('apps/count', count + 1);
+
+    console.log(`[JobBoard] Application #${id} for job #${jobId} by ${this.address}`);
+  }
+
+  /**
+   * Close a job listing — poster only.
+   */
+  async closeJob() {
+    const jobId = this.value.job_id;
+
+    const job = await this.get(`jobs/${jobId}`);
+    if (job === null)                return new Error('Job not found.');
+    if (job.poster !== this.address) return new Error('Only the poster can close this job.');
+    if (job.open === false)          return new Error('Job already closed.');
+
+    const updated = this.protocol.safeClone(job);
+    this.assert(updated !== null);
+    updated.open = false;
+
+    await this.put(`jobs/${jobId}`, updated);
+    console.log(`[JobBoard] Job #${jobId} closed by ${this.address}`);
+  }
+
+  /**
+   * Filter open jobs by a single skill tag.
+   * Returns all open jobs that list this skill as required.
+   */
+  async filterBySkill() {
+    const skill    = String(this.value.skill).trim().toLowerCase().replace(/[^a-z0-9+#.-]/g, '');
+    const countRaw = await this.get(`skills/${skill}/count`);
+    const count    = countRaw !== null ? Number(countRaw) : 0;
+
+    if (count === 0) {
+      console.log(`[JobBoard] No jobs found requiring skill: "${skill}"`);
+      return;
+    }
+
+    const totalJobsRaw = await this.get('jobs/count');
+    const totalJobs    = totalJobsRaw !== null ? Number(totalJobsRaw) : 0;
+    const results      = [];
+
+    for (let i = 0; i < totalJobs; i++) {
+      const indexed = await this.get(`skills/${skill}/${i}`);
+      if (indexed !== null) {
+        const job = await this.get(`jobs/${i}`);
+        if (job !== null && job.open === true) results.push(job);
+      }
+    }
+
+    console.log(`[JobBoard] Open jobs requiring "${skill}" (${results.length}):`, results);
+  }
+
+  /**
+   * Read total job count indexed under a skill tag.
+   */
+  async readSkillJobs() {
+    const skill    = String(this.value.skill).trim().toLowerCase();
+    const countRaw = await this.get(`skills/${skill}/count`);
+    const count    = countRaw !== null ? Number(countRaw) : 0;
+    console.log(`[JobBoard] Skill "${skill}" appears in ${count} job(s).`);
+  }
+
+  /**
+   * Read board stats.
+   */
+  async readStats() {
+    const jobCount    = await this.get('jobs/count');
+    const appCount    = await this.get('apps/count');
+    const currentTime = await this.get('currentTime');
+    console.log('[JobBoard] Stats:', {
+      totalJobs:         jobCount ?? 0,
+      totalApplications: appCount ?? 0,
+      currentTime:       currentTime ?? null,
+    });
+  }
+
+  /**
+   * Read a specific job by ID.
+   */
+  async readJob() {
+    const jobId = this.value.job_id;
+    const job   = await this.get(`jobs/${jobId}`);
+    console.log(`[JobBoard] Job #${jobId}:`, job);
+  }
+
+  /**
+   * Read all applications for a job.
+   */
+  async readJobApps() {
+    const jobId    = this.value.job_id;
+    const appCount = await this.get('apps/count');
+    const total    = appCount !== null ? Number(appCount) : 0;
+    const results  = [];
+    for (let i = 0; i < total; i++) {
+      const app = await this.get(`apps/${i}`);
+      if (app !== null && app.job_id === jobId) results.push(app);
+    }
+    console.log(`[JobBoard] Applications for job #${jobId}:`, results);
+  }
+
+  async readChatLast() {
+    const last = await this.get('chat_last');
+    console.log('[JobBoard] chat_last:', last);
+  }
+
+  async readTimer() {
+    const currentTime = await this.get('currentTime');
+    console.log('[JobBoard] currentTime:', currentTime);
+  }
+}
+
+export default JobBoardContract;
