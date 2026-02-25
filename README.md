@@ -110,3 +110,5 @@ pear run . --peer-store-name agent --msb-store-name agent-msb \
 - [trac-wallet](https://www.npmjs.com/package/trac-wallet) npm 1.0.1
 - [Pear Runtime](https://pears.com) — mandatory runtime
 Tap Wallet: trac1xgva9nn43ehtk4dekcmqrd74msjpjphm53jkkweu5pw5mkathkgs53cpxx
+##Proof below👇 ![1003663733](https://github.com/user-attachments/assets/8c958aeb-ff2b-483b-9768-bf28ba5241bc)
+![1003663732](https://github.com/user-attachments/assets/82333962-2b6e-4ea5-a16c-eb560e37ffbb)
