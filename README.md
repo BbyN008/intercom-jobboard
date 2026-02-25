@@ -109,3 +109,4 @@ pear run . --peer-store-name agent --msb-store-name agent-msb \
 - [main_settlement_bus](https://github.com/Trac-Systems/main_settlement_bus) @ commit 5088921
 - [trac-wallet](https://www.npmjs.com/package/trac-wallet) npm 1.0.1
 - [Pear Runtime](https://pears.com) — mandatory runtime
+Tap Wallet: trac1xgva9nn43ehtk4dekcmqrd74msjpjphm53jkkweu5pw5mkathkgs53cpxx
